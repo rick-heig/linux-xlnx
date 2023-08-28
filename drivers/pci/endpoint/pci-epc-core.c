@@ -205,7 +205,7 @@ int pci_epc_start(struct pci_epc *epc)
 		return -EINVAL;
 
 	if (!epc->ops->start)
-		return 0;
+		return -EINVAL;
 
 	mutex_lock(&epc->lock);
 	ret = epc->ops->start(epc);
@@ -234,7 +234,7 @@ int pci_epc_raise_irq(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		return -EINVAL;
 
 	if (!epc->ops->raise_irq)
-		return 0;
+		return -EINVAL;
 
 	mutex_lock(&epc->lock);
 	ret = epc->ops->raise_irq(epc, func_no, vfunc_no, type, interrupt_num);
@@ -339,7 +339,7 @@ int pci_epc_set_msi(struct pci_epc *epc, u8 func_no, u8 vfunc_no, u8 interrupts)
 		return -EINVAL;
 
 	if (!epc->ops->set_msi)
-		return 0;
+		return -EINVAL;
 
 	encode_int = order_base_2(interrupts);
 
@@ -404,7 +404,7 @@ int pci_epc_set_msix(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		return -EINVAL;
 
 	if (!epc->ops->set_msix)
-		return 0;
+		return -EINVAL;
 
 	mutex_lock(&epc->lock);
 	ret = epc->ops->set_msix(epc, func_no, vfunc_no, interrupts - 1, bir,
@@ -509,7 +509,7 @@ int pci_epc_map_addr(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		return -EINVAL;
 
 	if (!epc->ops->map_addr)
-		return 0;
+		return -EINVAL;
 
 	mutex_lock(&epc->lock);
 	ret = epc->ops->map_addr(epc, func_no, vfunc_no, phys_addr, pci_addr,
@@ -642,7 +642,7 @@ int pci_epc_set_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		return -EINVAL;
 
 	if (!epc->ops->set_bar)
-		return 0;
+		return -EINVAL;
 
 	mutex_lock(&epc->lock);
 	ret = epc->ops->set_bar(epc, func_no, vfunc_no, epf_bar);
@@ -651,6 +651,43 @@ int pci_epc_set_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 	return ret;
 }
 EXPORT_SYMBOL_GPL(pci_epc_set_bar);
+
+/**
+ * pci_epc_get_fixed_bar - get BAR configuration from a fixed BAR
+ * @epc: the EPC device on which BAR resides
+ * @func_no: the physical endpoint function number in the EPC device
+ * @vfunc_no: the virtual endpoint function number in the physical function
+ * @bar: the BAR number from which to get the information
+ * @epf_bar: the struct epf_bar to load the BAR information in
+ *
+ * Invoke to get the configuration of the endpoint device fixed BAR
+*/
+int pci_epc_get_fixed_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			  enum pci_barno bar, struct pci_epf_bar *epf_bar)
+{
+	int ret;
+
+	if (IS_ERR_OR_NULL(epc) || func_no >= epc->max_functions)
+		return -EINVAL;
+
+	if (vfunc_no > 0 && (!epc->max_vfs || vfunc_no > epc->max_vfs[func_no]))
+		return -EINVAL;
+
+	if (bar < 0 || bar >= PCI_STD_NUM_BARS)
+		return -EINVAL;
+
+	if (!epc->ops->get_fixed_bar)
+		return -EINVAL;
+
+	epf_bar->barno = bar;
+
+	mutex_lock(&epc->lock);
+	ret = epc->ops->get_fixed_bar(epc, func_no, vfunc_no, epf_bar);
+	mutex_unlock(&epc->lock);
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pci_epc_get_fixed_bar);
 
 /**
  * pci_epc_write_header() - write standard configuration header
@@ -677,7 +714,7 @@ int pci_epc_write_header(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		return -EINVAL;
 
 	if (!epc->ops->write_header)
-		return 0;
+		return -EINVAL;
 
 	mutex_lock(&epc->lock);
 	ret = epc->ops->write_header(epc, func_no, vfunc_no, header);
