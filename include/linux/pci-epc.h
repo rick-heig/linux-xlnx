@@ -44,6 +44,7 @@ pci_epc_interface_string(enum pci_epc_interface_type type)
  * @write_header: ops to populate configuration space header
  * @set_bar: ops to configure the BAR
  * @clear_bar: ops to reset the BAR
+ * @get_fixed_bar: map a fixed bar to kernel space (device/arch dependent)
  * @map_addr: ops to map CPU address to PCI address
  * @unmap_addr: ops to unmap CPU address and PCI address
  * @set_msi: ops to set the requested number of MSI interrupts in the MSI
@@ -68,6 +69,8 @@ struct pci_epc_ops {
 			   struct pci_epf_bar *epf_bar);
 	void	(*clear_bar)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 			     struct pci_epf_bar *epf_bar);
+	int	(*get_fixed_bar)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+				 struct pci_epf_bar *epf_bar);
 	int	(*map_addr)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 			    phys_addr_t addr, u64 pci_addr, size_t size);
 	void	(*unmap_addr)(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
@@ -160,8 +163,10 @@ struct pci_epc {
  * @msi_capable: indicate if the endpoint function has MSI capability
  * @msix_capable: indicate if the endpoint function has MSI-X capability
  * @reserved_bar: bitmap to indicate reserved BAR unavailable to function driver
+ * @fixed_bar: physical address,size, and flags of BAR are fixed
  * @bar_fixed_64bit: bitmap to indicate fixed 64bit BARs
  * @bar_fixed_size: Array specifying the size supported by each BAR
+ * //@bar_fixed_addr: Array specifying the fixed address of the BAR (if non NULL)
  * @align: alignment size required for BAR buffer allocation
  */
 struct pci_epc_features {
@@ -170,8 +175,10 @@ struct pci_epc_features {
 	unsigned int	msi_capable : 1;
 	unsigned int	msix_capable : 1;
 	u8	reserved_bar;
+	u8	fixed_bar;
 	u8	bar_fixed_64bit;
 	u64	bar_fixed_size[PCI_STD_NUM_BARS];
+	//phys_addr_t	bar_fixed_addr[PCI_STD_NUM_BARS];
 	size_t	align;
 };
 
@@ -214,6 +221,8 @@ int pci_epc_set_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		    struct pci_epf_bar *epf_bar);
 void pci_epc_clear_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		       struct pci_epf_bar *epf_bar);
+int pci_epc_get_fixed_bar(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
+			  enum pci_barno bar, struct pci_epf_bar *epf_bar);
 int pci_epc_map_addr(struct pci_epc *epc, u8 func_no, u8 vfunc_no,
 		     phys_addr_t phys_addr,
 		     u64 pci_addr, size_t size);

@@ -322,10 +322,14 @@ static void pci_epf_test_copy(struct pci_epf_test *epf_test,
 	void __iomem *dst_addr;
 	phys_addr_t src_phys_addr;
 	phys_addr_t dst_phys_addr;
+	u64 reg_src_addr, reg_dst_addr;
 	struct timespec64 start, end;
 	struct pci_epf *epf = epf_test->epf;
 	struct device *dev = &epf->dev;
 	struct pci_epc *epc = epf->epc;
+
+	memcpy_fromio(&reg_src_addr, &reg->src_addr, sizeof(reg_src_addr));
+	memcpy_fromio(&reg_dst_addr, &reg->dst_addr, sizeof(reg_dst_addr));
 
 	src_addr = pci_epc_mem_alloc_addr(epc, &src_phys_addr, reg->size);
 	if (!src_addr) {
@@ -336,7 +340,7 @@ static void pci_epf_test_copy(struct pci_epf_test *epf_test,
 	}
 
 	ret = pci_epc_map_addr(epc, epf->func_no, epf->vfunc_no, src_phys_addr,
-			       reg->src_addr, reg->size);
+			       reg_src_addr, reg->size);
 	if (ret) {
 		dev_err(dev, "Failed to map source address\n");
 		reg->status = STATUS_SRC_ADDR_INVALID;
@@ -352,7 +356,7 @@ static void pci_epf_test_copy(struct pci_epf_test *epf_test,
 	}
 
 	ret = pci_epc_map_addr(epc, epf->func_no, epf->vfunc_no, dst_phys_addr,
-			       reg->dst_addr, reg->size);
+			       reg_dst_addr, reg->size);
 	if (ret) {
 		dev_err(dev, "Failed to map destination address\n");
 		reg->status = STATUS_DST_ADDR_INVALID;
@@ -417,11 +421,14 @@ static void pci_epf_test_read(struct pci_epf_test *epf_test,
 	u32 crc32;
 	phys_addr_t phys_addr;
 	phys_addr_t dst_phys_addr;
+	u64 reg_src_addr;
 	struct timespec64 start, end;
 	struct pci_epf *epf = epf_test->epf;
 	struct device *dev = &epf->dev;
 	struct pci_epc *epc = epf->epc;
 	struct device *dma_dev = epf->epc->dev.parent;
+
+	memcpy_fromio(&reg_src_addr, &reg->src_addr, sizeof(reg_src_addr));
 
 	src_addr = pci_epc_mem_alloc_addr(epc, &phys_addr, reg->size);
 	if (!src_addr) {
@@ -432,7 +439,7 @@ static void pci_epf_test_read(struct pci_epf_test *epf_test,
 	}
 
 	ret = pci_epc_map_addr(epc, epf->func_no, epf->vfunc_no, phys_addr,
-			       reg->src_addr, reg->size);
+			       reg_src_addr, reg->size);
 	if (ret) {
 		dev_err(dev, "Failed to map address\n");
 		reg->status = STATUS_SRC_ADDR_INVALID;
@@ -457,7 +464,7 @@ static void pci_epf_test_read(struct pci_epf_test *epf_test,
 		ktime_get_ts64(&start);
 		ret = pci_epf_test_data_transfer(epf_test, dst_phys_addr,
 						 phys_addr, reg->size,
-						 reg->src_addr, DMA_DEV_TO_MEM);
+						 reg_src_addr, DMA_DEV_TO_MEM);
 		if (ret)
 			dev_err(dev, "Data transfer failed\n");
 		ktime_get_ts64(&end);
@@ -474,6 +481,7 @@ static void pci_epf_test_read(struct pci_epf_test *epf_test,
 				reg->flags & FLAG_USE_DMA);
 
 	crc32 = crc32_le(~0, buf, reg->size);
+	dev_info(dev, "local crc32 : %#x, host crc32 : %#x\n", crc32, reg->checksum);
 	if (crc32 != reg->checksum)
 		ret = -EIO;
 
@@ -501,11 +509,14 @@ static void pci_epf_test_write(struct pci_epf_test *epf_test,
 	void *buf;
 	phys_addr_t phys_addr;
 	phys_addr_t src_phys_addr;
+	u64 reg_dst_addr;
 	struct timespec64 start, end;
 	struct pci_epf *epf = epf_test->epf;
 	struct device *dev = &epf->dev;
 	struct pci_epc *epc = epf->epc;
 	struct device *dma_dev = epf->epc->dev.parent;
+
+	memcpy_fromio(&reg_dst_addr, &reg->dst_addr, sizeof(reg_dst_addr));
 
 	dst_addr = pci_epc_mem_alloc_addr(epc, &phys_addr, reg->size);
 	if (!dst_addr) {
@@ -516,7 +527,7 @@ static void pci_epf_test_write(struct pci_epf_test *epf_test,
 	}
 
 	ret = pci_epc_map_addr(epc, epf->func_no, epf->vfunc_no, phys_addr,
-			       reg->dst_addr, reg->size);
+			       reg_dst_addr, reg->size);
 	if (ret) {
 		dev_err(dev, "Failed to map address\n");
 		reg->status = STATUS_DST_ADDR_INVALID;
@@ -531,6 +542,7 @@ static void pci_epf_test_write(struct pci_epf_test *epf_test,
 
 	get_random_bytes(buf, reg->size);
 	reg->checksum = crc32_le(~0, buf, reg->size);
+	dev_info(dev, "local to host crc32 : %#x\n", reg->checksum);
 
 	if (reg->flags & FLAG_USE_DMA) {
 		src_phys_addr = dma_map_single(dma_dev, buf, reg->size,
@@ -545,7 +557,7 @@ static void pci_epf_test_write(struct pci_epf_test *epf_test,
 
 		ret = pci_epf_test_data_transfer(epf_test, phys_addr,
 						 src_phys_addr, reg->size,
-						 reg->dst_addr,
+						 reg_dst_addr,
 						 DMA_MEM_TO_DEV);
 		if (ret)
 			dev_err(dev, "Data transfer failed\n");
@@ -691,14 +703,18 @@ static void pci_epf_test_unbind(struct pci_epf *epf)
 	struct pci_epf_test *epf_test = epf_get_drvdata(epf);
 	struct pci_epc *epc = epf->epc;
 	struct pci_epf_bar *epf_bar;
+	const struct pci_epc_features *epc_features;
 	int bar;
+
+	epc_features = epf_test->epc_features;
 
 	cancel_delayed_work(&epf_test->cmd_handler);
 	pci_epf_test_clean_dma_chan(epf_test);
 	for (bar = 0; bar < PCI_STD_NUM_BARS; bar++) {
 		epf_bar = &epf->bar[bar];
 
-		if (epf_test->reg[bar]) {
+		if (epf_test->reg[bar] &&
+		    !(epc_features->fixed_bar & (1 << bar))) {
 			pci_epc_clear_bar(epc, epf->func_no, epf->vfunc_no,
 					  epf_bar);
 			pci_epf_free_space(epf, epf_test->reg[bar], bar,
@@ -730,6 +746,9 @@ static int pci_epf_test_set_bar(struct pci_epf *epf)
 		add = (epf_bar->flags & PCI_BASE_ADDRESS_MEM_TYPE_64) ? 2 : 1;
 
 		if (!!(epc_features->reserved_bar & (1 << bar)))
+			continue;
+
+		if (!!(epc_features->fixed_bar & (1 << bar)))
 			continue;
 
 		ret = pci_epc_set_bar(epc, epf->func_no, epf->vfunc_no,
@@ -823,7 +842,7 @@ static int pci_epf_test_alloc_space(struct pci_epf *epf)
 	size_t pba_size = 0;
 	bool msix_capable;
 	void *base;
-	int bar, add;
+	int bar, add, ret;
 	enum pci_barno test_reg_bar = epf_test->test_reg_bar;
 	const struct pci_epc_features *epc_features;
 	size_t test_reg_size;
@@ -847,11 +866,22 @@ static int pci_epf_test_alloc_space(struct pci_epf *epf)
 		test_reg_size = bar_size[test_reg_bar];
 	}
 
-	base = pci_epf_alloc_space(epf, test_reg_size, test_reg_bar,
-				   epc_features->align, PRIMARY_INTERFACE);
-	if (!base) {
-		dev_err(dev, "Failed to allocated register space\n");
-		return -ENOMEM;
+	if (!!(epc_features->fixed_bar & (1 << test_reg_bar))) {
+		ret = pci_epc_get_fixed_bar(epf->epc, epf->func_no,
+					    epf->vfunc_no, test_reg_bar,
+					    &epf->bar[test_reg_bar]);
+		if (ret < 0) {
+			dev_err(dev, "Failed to get fixed bar");
+			return ret;
+		}
+		base = epf->bar[test_reg_bar].addr;
+	} else {
+		base = pci_epf_alloc_space(epf, test_reg_size, test_reg_bar,
+					   epc_features->align, PRIMARY_INTERFACE);
+		if (!base) {
+			dev_err(dev, "Failed to allocated register space\n");
+			return -ENOMEM;
+		}
 	}
 	epf_test->reg[test_reg_bar] = base;
 
@@ -865,9 +895,20 @@ static int pci_epf_test_alloc_space(struct pci_epf *epf)
 		if (!!(epc_features->reserved_bar & (1 << bar)))
 			continue;
 
-		base = pci_epf_alloc_space(epf, bar_size[bar], bar,
-					   epc_features->align,
-					   PRIMARY_INTERFACE);
+		if (!!(epc_features->fixed_bar & (1 << bar))) {
+			ret = pci_epc_get_fixed_bar(epf->epc, epf->func_no,
+						    epf->vfunc_no, bar,
+						    epf_bar);
+			if (ret < 0)
+				base = NULL;
+			else
+				base = epf->bar[bar].addr;
+		} else {
+			base = pci_epf_alloc_space(epf, bar_size[bar], bar,
+						   epc_features->align,
+						   PRIMARY_INTERFACE);
+		}
+
 		if (!base)
 			dev_err(dev, "Failed to allocate space for BAR%d\n",
 				bar);
