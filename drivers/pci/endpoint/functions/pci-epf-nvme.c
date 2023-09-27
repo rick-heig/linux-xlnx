@@ -427,13 +427,21 @@ static CsCapabilities tsp_cs_caps = {
 static const char *TSP_CS_ID_STRING = "This device has compute";
 
 /* We could have more chardevs to userspace */
-#define MAX_DEV 4
+#define MAX_IO_CDEVS 4
+#define MAX_ADMIN_CDEVS 4
+#define MAX_DEV (MAX_IO_CDEVS + MAX_ADMIN_CDEVS)
 
 static DEFINE_SPINLOCK(touser_wr_lk);
 static DEFINE_SPINLOCK(touser_rd_lk);
 static DECLARE_KFIFO(touser_fifo, typeof(struct pci_epf_nvme_cmd *),
 		     PCI_EPF_NVME_FIFO_SIZE);
 DECLARE_WAIT_QUEUE_HEAD(touser_wq);
+static DEFINE_SPINLOCK(touser_admin_wr_lk);
+static DEFINE_SPINLOCK(touser_admin_rd_lk);
+static DECLARE_KFIFO(touser_admin_fifo, typeof(struct pci_epf_nvme_cmd *),
+		     PCI_EPF_NVME_FIFO_SIZE);
+DECLARE_WAIT_QUEUE_HEAD(touser_admin_wq);
+
 
 /*
  * Maximum data transfer size: limit to 128 KB to avoid excessive local
@@ -653,7 +661,8 @@ struct pci_epf_nvme {
 
 	/* Towards Storage Processing (TSP) */
 	struct uio_info			uio_info;
-	struct tsp_file_data		tsp_file_data[MAX_DEV];
+	struct tsp_file_data		tsp_user_queue[MAX_IO_CDEVS];
+	struct tsp_file_data		tsp_admin_queue[MAX_ADMIN_CDEVS];
 	struct class 			*tsp_class;
 	bool				user_path_enable;
 	void				*tsp_alloc_ctx;
@@ -3503,16 +3512,26 @@ static void pci_epf_nvme_process_admin_cmd(struct pci_epf_nvme_cmd *epcmd)
 	int ret = 0;
 
 	if (epcmd->cmd.common.opcode >= nvme_admin_vendor_start) {
-		status = pci_epf_nvme_process_custom_admin_cmd(epf_nvme, epcmd);
-		/* The above returns -1 to show that the cmd is deferred */
-		if (status == (u16)-1) {
-			/* Request is handled by another thread / task */
+		if (epcmd->cmd.common.opcode == 0xCC) {
+			/* Redirect these commands to user space */
+			pci_epf_nvme_set_uc_path(epcmd);
 			return;
-		} else if (status < 0) {
-			dev_warn(&epf_nvme->epf->dev, "Negative status from custom admin command\n");
 		} else {
-			/* This might not be needed, it should be set */
-			epcmd->status = status;
+			status = pci_epf_nvme_process_custom_admin_cmd(epf_nvme,
+								       epcmd);
+			/* The above returns -1 to show that the cmd is deferred
+			 */
+			if (status == (u16)-1) {
+				/* Request is handled by another thread / task */
+				return;
+			} else if (status < 0) {
+				dev_warn(&epf_nvme->epf->dev,
+					"Negative status from custom admin"
+					" command\n");
+			} else {
+				/* This might not be needed, it should be set */
+				epcmd->status = status;
+			}
 		}
 		goto complete;
 	}
@@ -3608,8 +3627,14 @@ void pci_epf_nvme_send_cmd_to_user(struct pci_epf_nvme_cmd *epcmd)
 	/* XXX TODO Handle full FIFO XXX (unlikely) */
 
 	/* Lock because this is called from multiple threads */
-	kfifo_in_spinlocked(&touser_fifo, &epcmd, 1, &touser_wr_lk);
-	wake_up(&touser_wq);
+	if (epcmd->sqid == 0) { /* admin */
+		kfifo_in_spinlocked(&touser_admin_fifo, &epcmd, 1,
+				    &touser_admin_wr_lk);
+		wake_up(&touser_admin_wq);
+	} else { /* IO */
+		kfifo_in_spinlocked(&touser_fifo, &epcmd, 1, &touser_wr_lk);
+		wake_up(&touser_wq);
+	}
 }
 
 void pci_epf_nvme_process_custom_io_cmd(struct pci_epf_nvme_cmd *epcmd)
@@ -3965,6 +3990,95 @@ fail_command:
 	return -EFAULT;
 }
 
+static ssize_t tsp_admin_read(struct file *file, char __user *buf, size_t count,
+			      loff_t *offset)
+{
+	int ret;
+	struct tsp_file_data *tfd = file->private_data;
+	struct pci_epf_nvme *epf_nvme = tfd->epf_nvme;
+
+	if (!tfd) {
+		dev_err(&epf_nvme->epf->dev,
+			"Missing file data pointer !\n");
+		return -EFAULT;
+	}
+
+	if (count < sizeof(struct nvme_command))
+		return -EINVAL;
+
+	if (tfd->epcmd) {
+		dev_warn(&epf_nvme->epf->dev,
+			 "Cannot process multiple commands for the moment\n");
+		return -EINVAL;
+	}
+
+	spin_lock(&touser_admin_rd_lk);
+	while (kfifo_is_empty(&touser_admin_fifo)) {
+		spin_unlock(&touser_admin_rd_lk);
+		if (file->f_flags & O_NONBLOCK) /* Do not block */
+			return 0;
+		ret = wait_event_interruptible(touser_admin_wq,
+				!kfifo_is_empty(&touser_admin_fifo));
+		if (ret < 0) /* Interrupted by signal */
+			return 0;
+
+		spin_lock(&touser_admin_rd_lk);
+	}
+
+	ret = kfifo_get(&touser_admin_fifo, &tfd->epcmd);
+	spin_unlock(&touser_admin_rd_lk);
+	if (ret != 1) {
+		dev_err(&epf_nvme->epf->dev,
+			"Could not get element from touser admin FIFO\n");
+		return -EFAULT;
+	}
+
+	if (!tfd->epcmd) {
+		dev_err(&epf_nvme->epf->dev,
+			"Missing epcmd pointer !\n");
+		return -EFAULT;
+	}
+
+	if (!buf) {
+		dev_err(&epf_nvme->epf->dev,
+			"Userspace buffer pointer seems to be NULL\n");
+		return -EFAULT;
+	}
+
+	if (count < (sizeof(tfd->epcmd->cmd) + sizeof(tfd->epcmd->buffer_size))) {
+		dev_err(&epf_nvme->epf->dev,
+			"Userspace buffer is too small\n");
+		/* Not we could requeue it as well ... */
+		goto fail_command;
+	}
+	ret = copy_to_user(buf, &tfd->epcmd->cmd, sizeof(tfd->epcmd->cmd));
+	if (ret) {
+		dev_err(&epf_nvme->epf->dev,
+			"Incomplete copy to user fail\n");
+		goto fail_command;
+	}
+	count = sizeof(tfd->epcmd->cmd);
+	if (tfd->epcmd->buffer && tfd->epcmd->buffer_size) {
+		ret = copy_to_user(buf + sizeof(tfd->epcmd->cmd),
+				   tfd->epcmd->buffer,
+				   tfd->epcmd->buffer_size);
+		if (ret) {
+			dev_err(&epf_nvme->epf->dev,
+				"Incomplete copy to user fail on buffer\n");
+			goto fail_command;
+		}
+	}
+	count += tfd->epcmd->buffer_size;
+
+	return count;
+
+fail_command:
+	tfd->epcmd->status = NVME_SC_INTERNAL;
+	pci_epf_nvme_send_cmd_to_completion(tfd->epcmd);
+	tfd->epcmd = NULL;
+	return -EFAULT;
+}
+
 static ssize_t tsp_write(struct file *file, const char __user *buf, size_t count,
 			 loff_t *offset)
 {
@@ -4009,11 +4123,19 @@ fail_command:
 	return -EFAULT;
 }
 
-static const struct file_operations tsp_fops = {
+static const struct file_operations tsp_io_fops = {
 	.owner		= THIS_MODULE,
 	.open		= tsp_open,
 	.release	= tsp_release,
 	.read		= tsp_read,
+	.write		= tsp_write
+};
+
+static const struct file_operations tsp_admin_fops = {
+	.owner		= THIS_MODULE,
+	.open		= tsp_open,
+	.release	= tsp_release,
+	.read		= tsp_admin_read,
 	.write		= tsp_write
 };
 
@@ -4473,6 +4595,7 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 		return ret; /* XXX memory should be freed XXX */
 
 	INIT_KFIFO(touser_fifo);
+	INIT_KFIFO(touser_admin_fifo);
 
 	/* allocate chardev region and assign Major number */
 	ret = alloc_chrdev_region(&dev, 0, MAX_DEV, "tspchardev");
@@ -4492,12 +4615,12 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 
 	/* add device to the system where "i" is the Minor number of the new
 	 * device */
-	for (i = 0; i < MAX_DEV; ++i) {
+	for (i = 0; i < MAX_IO_CDEVS; ++i) {
 		/* init new device */
-		cdev_init(&epf_nvme->tsp_file_data[i].cdev, &tsp_fops);
-		epf_nvme->tsp_file_data[i].cdev.owner = THIS_MODULE;
+		cdev_init(&epf_nvme->tsp_user_queue[i].cdev, &tsp_io_fops);
+		epf_nvme->tsp_user_queue[i].cdev.owner = THIS_MODULE;
 
-		ret = cdev_add(&epf_nvme->tsp_file_data[i].cdev,
+		ret = cdev_add(&epf_nvme->tsp_user_queue[i].cdev,
 			       MKDEV(dev_major, i), 1);
 		if (ret < 0) {
 			dev_err(&epf->dev, "Could not add character device\n");
@@ -4507,10 +4630,32 @@ static int pci_epf_nvme_probe(struct pci_epf *epf,
 		/* create device node /dev/mychardev-x where "x" is "i", equal
 		 * to the Minor number */
 		device_create(epf_nvme->tsp_class, NULL, MKDEV(dev_major, i),
-			      NULL, "tsp-%d", i);
+			      NULL, "tsp-io-%d", i);
 
-		epf_nvme->tsp_file_data[i].epf_nvme = epf_nvme;
-		mutex_init(&epf_nvme->tsp_file_data[i].mutex);
+		epf_nvme->tsp_user_queue[i].epf_nvme = epf_nvme;
+		mutex_init(&epf_nvme->tsp_user_queue[i].mutex);
+	}
+
+	for (i = 0; i < MAX_ADMIN_CDEVS; ++i) {
+		/* init new device */
+		cdev_init(&epf_nvme->tsp_admin_queue[i].cdev, &tsp_admin_fops);
+		epf_nvme->tsp_admin_queue[i].cdev.owner = THIS_MODULE;
+
+		ret = cdev_add(&epf_nvme->tsp_admin_queue[i].cdev,
+			       MKDEV(dev_major, i + MAX_IO_CDEVS), 1);
+		if (ret < 0) {
+			dev_err(&epf->dev, "Could not add character device\n");
+			return ret;
+		}
+
+		/* create device node /dev/mychardev-x where "x" is "i", equal
+		 * to the Minor number */
+		device_create(epf_nvme->tsp_class, NULL,
+			      MKDEV(dev_major, i + MAX_IO_CDEVS),
+			      NULL, "tsp-admin-%d", i);
+
+		epf_nvme->tsp_admin_queue[i].epf_nvme = epf_nvme;
+		mutex_init(&epf_nvme->tsp_admin_queue[i].mutex);
 	}
 
 	return 0;
