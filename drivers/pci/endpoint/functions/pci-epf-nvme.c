@@ -4793,11 +4793,26 @@ static ssize_t pci_epf_nvme_num_xfer_threads_store(struct config_item *item,
 
 CONFIGFS_ATTR(pci_epf_nvme_, num_xfer_threads);
 
+static ssize_t pci_epf_nvme_cba_show(struct config_item *item, char *page)
+{
+	struct config_group *group = to_config_group(item);
+	struct pci_epf_nvme *epf_nvme = to_epf_nvme(group);
+	u64 cmbmsc, cba;
+
+	cmbmsc = pci_epf_nvme_reg_read64(&epf_nvme->ctrl, NVME_REG_CMBMSC);
+	cba = cmbmsc & CMBMSC_CBA_MASK;
+
+	return sysfs_emit(page, "%#016llx\n", cba);
+}
+
+CONFIGFS_ATTR_RO(pci_epf_nvme_, cba);
+
 static struct configfs_attribute *pci_epf_nvme_attrs[] = {
 	&pci_epf_nvme_attr_ctrl_opts,
 	&pci_epf_nvme_attr_dma_enable,
 	&pci_epf_nvme_attr_user_path_enable,
 	&pci_epf_nvme_attr_num_xfer_threads,
+	&pci_epf_nvme_attr_cba,
 	NULL,
 };
 
